@@ -1,0 +1,11 @@
+[project]
+name = "firmaelectronica"
+version = "0.5.2"
+requires-python = ">=3.13"
+dependencies = [
+    "pyhanko[opentype,image-support]>=0.29",
+    "pymupdf>=1.26",
+    "pillow>=11",
+    "cryptography>=45",
+    "pyside6>=6.8",
+]
