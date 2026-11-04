@@ -26,7 +26,14 @@ Programa de escritorio para Linux para firmar documentos con **dos firmas a la v
   página. Lo que se ve es exactamente lo que sale en el PDF.
 - **Varias firmas en un mismo PDF:** después de firmar se puede pasar a «Que firme otra persona»;
   cada firma se agrega sin invalidar las anteriores.
-- **Verificar:** muestra quién firmó, cuándo y si el PDF cambió después de cada firma.
+- **Sello de tiempo:** al firmar se pide un sello de tiempo (RFC 3161) a DigiCert o Sectigo,
+  gratis: la fecha la certifica un tercero, no el reloj de la PC. Solo viaja una huella (hash)
+  de la firma, nunca el documento. Sin internet, el programa pregunta si firmar sin sello.
+- **Revocar (robo o pérdida):** marca el certificado actual como revocado desde ese momento y
+  crea uno nuevo. Lo firmado antes **con** sello de tiempo se sigue verificando bien; lo demás
+  sale como «revocada».
+- **Verificar:** muestra quién firmó, cuándo (y si la fecha viene del sello de tiempo), si el
+  PDF cambió después de cada firma y si el certificado está revocado.
 - Clic derecho en Dolphin (KDE): «Firmar con Firma Electrónica» y «Verificar firma electrónica».
 
 ## Instalar
@@ -60,9 +67,16 @@ Desde la terminal:
 ## Dónde se guardan los datos
 
 `~/.local/share/firma-electronica/firmas/<persona>/` (carpetas 700, archivos 600):
-`certificado.p12` (llave privada, cifrada con la contraseña), `certificado.cer` (público),
-`firma.png`, `perfil.json` y `anteriores/` (certificados renovados, para seguir verificando lo
-ya firmado). Las firmas eliminadas pasan a `eliminadas/` por la misma razón.
+`certificado.llave` (llave privada) y `firma.png.cifrado` (dibujo), los dos **cifrados** con
+AES-256-GCM y una llave sacada de la contraseña con **scrypt** (128 MB de memoria por intento,
+así que probar contraseñas a fuerza bruta es muy lento); `certificado.cer` (público),
+`perfil.json` y `anteriores/` (solo la parte pública de los certificados renovados, para seguir
+verificando lo ya firmado). Las firmas eliminadas pasan a `eliminadas/` igual: solo con su parte
+pública, sus llaves y su dibujo se destruyen. Los certificados revocados se anotan en
+`revocados.json`. Las contraseñas deben tener al menos 12 caracteres (puede ser una frase).
+
+Las firmas de versiones anteriores (`certificado.p12` + `firma.png` sin cifrar) se pasan solas al
+formato nuevo la primera vez que se escribe su contraseña.
 
 **Las contraseñas no se pueden recuperar.** Si se olvida, se elimina esa firma y se crea otra;
 lo firmado antes se sigue verificando.

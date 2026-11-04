@@ -73,7 +73,8 @@ def _descargas() -> str:
 
 
 def pedir_clave(padre: QWidget, perfil: nucleo.Perfil, para: str):
-    """Pide la contraseña de esa firma hasta que sea correcta o se cancele. Regresa el firmante o None."""
+    """Pide la contraseña de esa firma hasta que sea correcta o se cancele.
+    Regresa (firmante, contraseña) o None."""
     texto = f"Contraseña de la firma de <b>{perfil.nombre}</b> para {para}:"
     while True:
         clave, ok = QInputDialog.getText(padre, nucleo.NOMBRE, texto, QLineEdit.EchoMode.Password)
@@ -83,7 +84,7 @@ def pedir_clave(padre: QWidget, perfil: nucleo.Perfil, para: str):
         firmante = perfil.abrir(clave)
         QApplication.restoreOverrideCursor()
         if firmante is not None:
-            return firmante
+            return firmante, clave
         texto = f"<span style='color:{ROJO}'>Contraseña incorrecta.</span> Inténtalo otra vez ({perfil.nombre}):"
 
 
@@ -217,6 +218,14 @@ class EditorDibujo(QWidget):
             self.pad.a_png(destino)
         destino.chmod(0o600)
 
+    def guardar_en(self, perfil: nucleo.Perfil, clave: str) -> None:
+        """Guarda el dibujo CIFRADO en la firma (el PNG pasa un instante por /dev/shm, en memoria)."""
+        base = "/dev/shm" if Path("/dev/shm").is_dir() else None
+        with tempfile.TemporaryDirectory(dir=base) as tmp:
+            png = Path(tmp) / "firma.png"
+            self.guardar(png)
+            perfil.guardar_dibujo(png, clave)
+
 
 class DialogoNuevaFirma(QDialog):
     def __init__(self, padre: QWidget) -> None:
@@ -231,7 +240,7 @@ class DialogoNuevaFirma(QDialog):
         self.txt_c1, self.txt_c2 = QLineEdit(), QLineEdit()
         for c in (self.txt_c1, self.txt_c2):
             c.setEchoMode(QLineEdit.EchoMode.Password)
-            c.setPlaceholderText("mínimo 8 caracteres")
+            c.setPlaceholderText(f"mínimo {nucleo.CLAVE_MIN} caracteres (puede ser una frase)")
         form = QFormLayout()
         form.addRow("Nombre completo:", self.txt_nombre)
         form.addRow("Cargo:", self.txt_cargo)
@@ -262,7 +271,7 @@ class DialogoNuevaFirma(QDialog):
         try:
             perfil = nucleo.crear_perfil(self.txt_nombre.text(), self.txt_cargo.text(), self.txt_c1.text())
             try:
-                self.editor.guardar(perfil.dibujo)
+                self.editor.guardar_en(perfil, self.txt_c1.text())
             except Exception:
                 perfil.eliminar()
                 raise
@@ -590,13 +599,14 @@ class Ventana(QWidget):
     def colocar_firma(self, conservar: bool) -> None:
         """Pone (o cambia) la firma en la hoja. conservar=True: mismo lugar y tamaño (cambió la persona)."""
         perfil = self.perfil_actual()
-        if not self.pdf or not perfil or not perfil.dibujo.exists():
+        if not self.pdf or not perfil or not perfil.tiene_dibujo:
             self.vista.poner_firma(None)
             self.refrescar_boton()
             return
         anterior = self.vista.firma
+        # El dibujo está cifrado: aquí va un recuadro de su mismo tamaño; el real se pone al firmar.
         sello = nucleo.componer_sello(perfil, dt.datetime.now())
-        dibujo_alto = QImage(str(perfil.dibujo)).height()
+        dibujo_alto = (perfil.dibujo_tam or (900, 300))[1]
         item = FirmaItem(QPixmap.fromImage(ImageQt(sello)), dibujo_alto / sello.height,
                          anterior.ancho if anterior and conservar else 170)
         item.al_cambiar = lambda a: self.sld_tam.setValue(int(a))
@@ -620,9 +630,9 @@ class Ventana(QWidget):
 
     def refrescar_boton(self) -> None:
         perfil = self.perfil_actual()
-        listo = bool(self.pdf and perfil and perfil.dibujo.exists() and self.vista.firma)
+        listo = bool(self.pdf and perfil and perfil.tiene_dibujo and self.vista.firma)
         self.b_firmar.setEnabled(listo)
-        if perfil and not perfil.dibujo.exists():
+        if perfil and not perfil.tiene_dibujo:
             self.b_firmar.setToolTip("Esta firma no tiene dibujo: agrégalo en la pestaña «Firmas».")
         elif not self.pdf:
             self.b_firmar.setToolTip("Primero abre un documento.")
@@ -637,12 +647,31 @@ class Ventana(QWidget):
         if salida.exists() and salida != self.origen and QMessageBox.question(
                 self, nucleo.NOMBRE, f"Ya existe {salida.name}. ¿Reemplazarlo?") != QMessageBox.StandardButton.Yes:
             return
-        firmante = pedir_clave(self, perfil, "firmar")
-        if firmante is None:
+        abierta = pedir_clave(self, perfil, "firmar")
+        if abierta is None:
             return
+        firmante, clave = abierta
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        con_sello = True
         try:
-            nucleo.firmar_pdf(self.pdf, salida, perfil, firmante, self.pagina, self.vista.firma.caja())
+            dibujo = perfil.leer_dibujo(clave)
+            while True:
+                try:
+                    nucleo.firmar_pdf(self.pdf, salida, perfil, firmante, dibujo, self.pagina,
+                                      self.vista.firma.caja(), con_sello=con_sello)
+                    break
+                except nucleo.SinSelloDeTiempo:
+                    QApplication.restoreOverrideCursor()
+                    r = QMessageBox.question(
+                        self, nucleo.NOMBRE,
+                        "No se pudo pedir el <b>sello de tiempo</b> (¿sin internet?).<br><br>"
+                        "Sin sello, la fecha de la firma es la del reloj de esta PC y no la certifica nadie; "
+                        "si algún día se revoca esta firma, este documento ya no saldría como válido.<br><br>"
+                        "¿Firmar de todos modos <b>sin sello de tiempo</b>?")
+                    if r != QMessageBox.StandardButton.Yes:
+                        return
+                    con_sello = False
+                    QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         except Exception as e:
             QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, nucleo.NOMBRE, f"No se pudo firmar:\n{e}")
@@ -650,7 +679,9 @@ class Ventana(QWidget):
         QApplication.restoreOverrideCursor()
 
         caja = QMessageBox(QMessageBox.Icon.Information, nucleo.NOMBRE,
-                           f"Listo, firmado por {perfil.nombre}:\n\n{salida}", parent=self)
+                           f"Listo, firmado por {perfil.nombre}"
+                           + (" (con sello de tiempo)" if con_sello else " (SIN sello de tiempo)")
+                           + f":\n\n{salida}", parent=self)
         b_abrir = caja.addButton("Abrir", QMessageBox.ButtonRole.AcceptRole)
         b_otra = caja.addButton("Que firme otra persona", QMessageBox.ButtonRole.ActionRole)
         caja.addButton("Cerrar", QMessageBox.ButtonRole.RejectRole)
@@ -685,23 +716,32 @@ class Ventana(QWidget):
         self.img_firma.setMinimumHeight(130)
         self.img_firma.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.img_firma.setStyleSheet("background: white; border-radius: 8px")
+        b_ver = QPushButton("Ver dibujo…")
+        b_ver.clicked.connect(self.ver_dibujo)
         b_dibujo = QPushButton("Cambiar dibujo…")
         b_dibujo.clicked.connect(self.cambiar_dibujo)
         b_renovar = QPushButton("Cambiar contraseña / renovar…")
         b_renovar.clicked.connect(self.renovar)
         b_cer = QPushButton("Guardar certificado público (.cer)…")
         b_cer.clicked.connect(self.exportar_cer)
+        b_revocar = QPushButton("Revocar (robo o pérdida)…")
+        b_revocar.setObjectName("peligro")
+        b_revocar.clicked.connect(self.revocar)
         b_borrar = QPushButton("Eliminar firma…")
         b_borrar.setObjectName("peligro")
         b_borrar.clicked.connect(self.eliminar_firma)
-        self.botones_firma = [b_dibujo, b_renovar, b_cer, b_borrar]
-        fila = QHBoxLayout()
-        for b in self.botones_firma:
+        self.botones_firma = [b_ver, b_dibujo, b_renovar, b_cer, b_revocar, b_borrar]
+        fila, fila2 = QHBoxLayout(), QHBoxLayout()
+        for b in self.botones_firma[:4]:
             fila.addWidget(b)
+        for b in self.botones_firma[4:]:
+            fila2.addWidget(b)
+        fila2.addStretch()
         der, ld = _tarjeta()
         ld.addWidget(self.lbl_detalle)
         ld.addWidget(self.img_firma)
         ld.addLayout(fila)
+        ld.addLayout(fila2)
         ld.addStretch()
 
         partir = QSplitter()
@@ -724,7 +764,7 @@ class Ventana(QWidget):
         self.cmb_firma.clear()
         self.lst_firmas.clear()
         for p in perfiles:
-            etiqueta = p.nombre + (f" — {p.cargo}" if p.cargo else "") + ("" if p.dibujo.exists() else " (sin dibujo)")
+            etiqueta = p.nombre + (f" — {p.cargo}" if p.cargo else "") + ("" if p.tiene_dibujo else " (sin dibujo)")
             self.cmb_firma.addItem(etiqueta, str(p.carpeta))
             it = QListWidgetItem(etiqueta)
             it.setData(Qt.ItemDataRole.UserRole, str(p.carpeta))
@@ -759,14 +799,32 @@ class Ventana(QWidget):
             f"<h3 style='margin:0'>{p.nombre}</h3>" + (f"{p.cargo}<br>" if p.cargo else "")
             + (f"Firma electrónica válida del {info['desde']:%d/%m/%Y} al {info['hasta']:%d/%m/%Y}<br>"
                f"<small>Huella: {info['huella']}</small>" if info else "")
-            + (f"<br><small>{anteriores} certificado(s) anterior(es) guardado(s).</small>" if anteriores else ""))
-        if p.dibujo.exists():
-            pm = QPixmap(str(p.dibujo))
-            self.img_firma.setPixmap(pm.scaled(520, 115, Qt.AspectRatioMode.KeepAspectRatio,
-                                               Qt.TransformationMode.SmoothTransformation))
+            + (f"<br><small>{anteriores} certificado(s) anterior(es) guardado(s) (solo la parte pública).</small>"
+               if anteriores else "")
+            + ("" if p.llave.exists() else f"<br><small style='color:{ROJO}'>Formato viejo (menos seguro): "
+               "se actualiza solo la próxima vez que pongas la contraseña.</small>"))
+        self.img_firma.setPixmap(QPixmap())
+        if p.dibujo_cifrado.exists():
+            self.img_firma.setText("🔒 El dibujo está protegido con la contraseña.<br>"
+                                   "<small>Usa «Ver dibujo…» para verlo.</small>")
+        elif p.dibujo.exists():
+            self.img_firma.setText("El dibujo todavía no está cifrado: se cifra la próxima vez que pongas "
+                                   "la contraseña (al firmar o con «Ver dibujo…»).")
         else:
-            self.img_firma.setPixmap(QPixmap())
             self.img_firma.setText(f"<span style='color:{ROJO}'>Sin dibujo: usa «Cambiar dibujo…»</span>")
+
+    def ver_dibujo(self) -> None:
+        p = self.firma_seleccionada()
+        abierta = p and pedir_clave(self, p, "ver su dibujo")
+        if not abierta:
+            return
+        img = p.leer_dibujo(abierta[1])
+        self.mostrar_firma()
+        if img is None:
+            return
+        pm = QPixmap.fromImage(ImageQt(img))
+        self.img_firma.setPixmap(pm.scaled(520, 115, Qt.AspectRatioMode.KeepAspectRatio,
+                                           Qt.TransformationMode.SmoothTransformation))
 
     def nueva_firma(self) -> None:
         d = DialogoNuevaFirma(self)
@@ -777,12 +835,13 @@ class Ventana(QWidget):
 
     def cambiar_dibujo(self) -> None:
         p = self.firma_seleccionada()
-        if not p or pedir_clave(self, p, "cambiar su dibujo") is None:
+        abierta = p and pedir_clave(self, p, "cambiar su dibujo")
+        if not abierta:
             return
         d = DialogoDibujo(self, p)
         if d.exec():
             try:
-                d.editor.guardar(p.dibujo)
+                d.editor.guardar_en(p, abierta[1])
             except Exception as e:
                 QMessageBox.warning(self, nucleo.NOMBRE, str(e))
                 return
@@ -796,16 +855,8 @@ class Ventana(QWidget):
                                           QLineEdit.EchoMode.Password)
         if not ok:
             return
-        nueva, ok = QInputDialog.getText(self, nucleo.NOMBRE, "Contraseña NUEVA (mínimo 8 caracteres):",
-                                         QLineEdit.EchoMode.Password)
-        if not ok:
-            return
-        otra, ok = QInputDialog.getText(self, nucleo.NOMBRE, "Repite la contraseña NUEVA:",
-                                        QLineEdit.EchoMode.Password)
-        if not ok:
-            return
-        if nueva != otra:
-            QMessageBox.warning(self, nucleo.NOMBRE, "Las contraseñas nuevas no coinciden.")
+        nueva = self._pedir_clave_nueva()
+        if nueva is None:
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
@@ -818,6 +869,61 @@ class Ventana(QWidget):
         self.mostrar_firma()
         QMessageBox.information(self, nucleo.NOMBRE, "Listo: nueva contraseña y certificado renovado. "
                                 "Los documentos firmados antes se siguen verificando.")
+
+    def _pedir_clave_nueva(self) -> str | None:
+        while True:
+            nueva, ok = QInputDialog.getText(self, nucleo.NOMBRE,
+                                             f"Contraseña NUEVA (mínimo {nucleo.CLAVE_MIN} caracteres; "
+                                             "puede ser una frase):", QLineEdit.EchoMode.Password)
+            if not ok:
+                return None
+            if len(nueva) < nucleo.CLAVE_MIN:
+                QMessageBox.warning(self, nucleo.NOMBRE, f"Debe tener al menos {nucleo.CLAVE_MIN} caracteres.")
+                continue
+            otra, ok = QInputDialog.getText(self, nucleo.NOMBRE, "Repite la contraseña NUEVA:",
+                                            QLineEdit.EchoMode.Password)
+            if not ok:
+                return None
+            if nueva == otra:
+                return nueva
+            QMessageBox.warning(self, nucleo.NOMBRE, "Las contraseñas nuevas no coinciden.")
+
+    def revocar(self) -> None:
+        p = self.firma_seleccionada()
+        if not p:
+            return
+        texto, ok = QInputDialog.getText(
+            self, nucleo.NOMBRE,
+            f"REVOCAR la firma de {p.nombre}: úsalo si te robaron o perdiste la PC, el respaldo o la "
+            "contraseña.\n\n· Desde este momento su certificado actual deja de ser de confianza.\n"
+            "· Lo que firmó antes CON sello de tiempo se sigue verificando bien; lo firmado sin sello "
+            "saldrá como «revocada».\n· Se crea un certificado nuevo con otra contraseña.\n\n"
+            "Escribe REVOCAR para continuar:")
+        if not ok or texto.strip().upper() != "REVOCAR":
+            return
+        motivo, ok = QInputDialog.getText(self, nucleo.NOMBRE, "Motivo (p. ej. «robo de la laptop»):")
+        if not ok:
+            return
+        actual, ok = QInputDialog.getText(self, nucleo.NOMBRE,
+                                          "Contraseña ACTUAL, si la recuerdas (para conservar el dibujo).\n"
+                                          "Si no, déjala vacía: después tendrás que volver a dibujar la firma.",
+                                          QLineEdit.EchoMode.Password)
+        if not ok:
+            return
+        nueva = self._pedir_clave_nueva()
+        if nueva is None:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            conservo = p.revocar(nueva, motivo.strip() or "sin motivo", actual)
+        except ValueError as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, nucleo.NOMBRE, str(e))
+            return
+        QApplication.restoreOverrideCursor()
+        self.recargar_firmas(seleccionar=p.carpeta)
+        QMessageBox.information(self, nucleo.NOMBRE, "Listo: certificado anterior REVOCADO y uno nuevo creado."
+                                + ("" if conservo else "\n\nAhora vuelve a dibujar la firma con «Cambiar dibujo…»."))
 
     def exportar_cer(self) -> None:
         p = self.firma_seleccionada()
@@ -836,7 +942,8 @@ class Ventana(QWidget):
             return
         texto, ok = QInputDialog.getText(
             self, nucleo.NOMBRE, f"Para eliminar la firma de {p.nombre} escribe ELIMINAR.\n"
-                                 "(Los documentos que ya firmó se siguen verificando.)")
+                                 "(Los documentos que ya firmó se siguen verificando; su llave y su dibujo se "
+                                 "destruyen, así que ya nadie podrá firmar con ella.)")
         if ok and texto.strip().upper() == "ELIMINAR":
             p.eliminar()
             self.recargar_firmas()
