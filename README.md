@@ -34,6 +34,15 @@ Programa de escritorio para Linux para firmar documentos con **dos firmas a la v
   sale como «revocada».
 - **Verificar:** muestra quién firmó, cuándo (y si la fecha viene del sello de tiempo), si el
   PDF cambió después de cada firma y si el certificado está revocado.
+- **Para el papel: QR + folio.** Junto a cada firma se imprime un código QR y un folio
+  (`FE-XXXX-XXXX`). La firma electrónica vive en el PDF; en papel solo queda la imagen, así que
+  la hoja impresa **no se puede verificar por sí sola**. Con el QR o el folio se encuentra el
+  original para compararlo.
+- **Archivo:** cada documento firmado se guarda solo, con su folio. Se busca por folio, persona
+  o documento; **«Revisar hoja impresa»** lee el QR de una foto o escaneo (imagen o PDF), abre el
+  original y avisa si la huella del QR no coincide; **«Comparar con otro PDF»** dice si un PDF es
+  exactamente el firmado, una versión anterior o un documento distinto. También detecta si la
+  copia del archivo se modificó.
 - Clic derecho en Dolphin (KDE): «Firmar con Firma Electrónica» y «Verificar firma electrónica».
 
 ## Instalar
@@ -73,7 +82,7 @@ así que probar contraseñas a fuerza bruta es muy lento); `certificado.cer` (p�
 `perfil.json` y `anteriores/` (solo la parte pública de los certificados renovados, para seguir
 verificando lo ya firmado). Las firmas eliminadas pasan a `eliminadas/` igual: solo con su parte
 pública, sus llaves y su dibujo se destruyen. Los certificados revocados se anotan en
-`revocados.json`. Las contraseñas deben tener al menos 12 caracteres (puede ser una frase).
+`revocados.json` y los documentos firmados en `archivo/<folio>/` (`firmado.pdf` + `datos.json`). Las contraseñas deben tener al menos 12 caracteres (puede ser una frase).
 
 Las firmas de versiones anteriores (`certificado.p12` + `firma.png` sin cifrar) se pasan solas al
 formato nuevo la primera vez que se escribe su contraseña.
@@ -84,8 +93,9 @@ lo firmado antes se sigue verificando.
 ## Hecho con
 
 [PySide6](https://doc.qt.io/qtforpython-6/) (LGPL-3.0), [pyHanko](https://github.com/MatthiasValvekens/pyHanko) (MIT),
-[PyMuPDF](https://github.com/pymupdf/PyMuPDF) (AGPL-3.0), [Pillow](https://python-pillow.org/) (MIT-CMU) y
-[cryptography](https://cryptography.io/) (Apache-2.0 / BSD-3-Clause).
+[PyMuPDF](https://github.com/pymupdf/PyMuPDF) (AGPL-3.0), [Pillow](https://python-pillow.org/) (MIT-CMU),
+[cryptography](https://cryptography.io/) (Apache-2.0 / BSD-3-Clause), [segno](https://github.com/heuer/segno) (BSD-3-Clause)
+y [zxing-cpp](https://github.com/zxing-cpp/zxing-cpp) (Apache-2.0).
 
 El código de este programa es MIT, pero **PyMuPDF es AGPL-3.0**: si redistribuyes el programa
 empaquetado junto con sus dependencias, ese paquete debe cumplir la AGPL-3.0 (en la práctica:

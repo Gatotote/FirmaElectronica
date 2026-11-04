@@ -20,6 +20,10 @@ Seguridad (v0.6):
   momento; lo firmado después (o sin sello de tiempo) ya no sale como válido.
 - Las llaves de certificados anteriores o eliminados se destruyen; solo se guarda la parte
   pública (.cer), que es lo único que hace falta para verificar.
+
+Papel (v0.7): junto a la firma se imprime un QR y un FOLIO (FE-XXXX-XXXX). Cada documento
+firmado se guarda en el Archivo (DATOS/archivo/<folio>/): con la hoja impresa (o su foto o
+escaneo) se encuentra el original y se puede comparar.
 """
 
 from __future__ import annotations
@@ -37,19 +41,24 @@ import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 CREDITO = "Este programa fue realizado por Genaro Velasco"
 NOMBRE = "Firma Electrónica"
 
 DATOS = Path.home() / ".local/share/firma-electronica"
 FIRMAS = DATOS / "firmas"
 REVOCADOS = DATOS / "revocados.json"
+ARCHIVO = DATOS / "archivo"
 CLAVE_MIN = 12
 # Servicios de sello de tiempo gratuitos cuyos certificados ya reconoce el sistema.
 TSAS = ("http://timestamp.digicert.com", "http://timestamp.sectigo.com")
 FUENTE = next((f for f in ("/usr/share/fonts/noto/NotoSans-Regular.ttf",
                            "/usr/share/fonts/TTF/DejaVuSans.ttf",
                            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf") if Path(f).exists()), None)
+FUENTE_FOLIO = next((f for f in ("/usr/share/fonts/noto/NotoSansMono-Bold.ttf",
+                                 "/usr/share/fonts/TTF/DejaVuSansMono-Bold.ttf",
+                                 "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf") if Path(f).exists()),
+                    FUENTE)
 
 # Formatos que se pueden firmar (todo se convierte a PDF antes de firmar).
 EXT_PDF = {".pdf"}
@@ -562,9 +571,56 @@ def _muestra_dibujo(perfil: Perfil):
     return img
 
 
-def componer_sello(perfil: Perfil, cuando: dt.datetime, dibujo=None):
-    """Dibujo de la firma + leyenda debajo, en UNA imagen (PIL). Sin `dibujo` (aún no se da la
-    contraseña) va un recuadro del mismo tamaño: lo que se acomoda en la vista es lo que sale."""
+FOLIO_MUESTRA = "FE-····-····"
+_ALFABETO_FOLIO = "23456789ABCDEFGHJKMNPQRSTVWXYZ"   # sin 0/O, 1/I/L ni U: no se confunden al teclear
+
+
+def nuevo_folio() -> str:
+    import secrets
+    while True:
+        c = "".join(secrets.choice(_ALFABETO_FOLIO) for _ in range(8))
+        folio = f"FE-{c[:4]}-{c[4:]}"
+        if not (ARCHIVO / folio).exists():
+            return folio
+
+
+def normalizar_folio(texto: str) -> str | None:
+    """«fe 7k3q 9m2d», «7K3Q9M2D», «FE-7K3Q-9M2D» → «FE-7K3Q-9M2D» (o None si no parece folio)."""
+    t = re.sub(r"[^A-Z0-9]", "", texto.upper())
+    t = t[2:] if t.startswith("FE") and len(t) == 10 else t
+    t = t.replace("O", "0").replace("I", "1")  # por si se teclea con letras parecidas
+    return f"FE-{t[:4]}-{t[4:]}" if len(t) == 8 else None
+
+
+def sha256_archivo(ruta: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(ruta, "rb") as f:
+        for bloque in iter(lambda: f.read(1 << 20), b""):
+            h.update(bloque)
+    return h.hexdigest().upper()
+
+
+def texto_qr(folio: str, nombre: str, cuando: dt.datetime, huella: str) -> str:
+    return (f"{NOMBRE}\nFolio: {folio}\nFirmó: {nombre}\nFecha: {cuando:%d/%m/%Y %H:%M}\n"
+            f"Huella: {huella[:16]}")
+
+
+def _imagen_qr(texto: str, lado: int):
+    import io
+    import segno
+    from PIL import Image
+    buf = io.BytesIO()
+    segno.make(texto, error="m").save(buf, kind="png", scale=10, border=1, dark="#14235a")
+    buf.seek(0)
+    return Image.open(buf).convert("RGBA").resize((lado, lado), Image.Resampling.NEAREST)
+
+
+def componer_sello(perfil: Perfil, cuando: dt.datetime, dibujo=None, folio: str | None = None,
+                   huella: str = ""):
+    """Dibujo de la firma + leyenda + folio, y el QR a la derecha, en UNA imagen (PIL).
+    Sin `dibujo` (aún no se da la contraseña) va un recuadro del mismo tamaño y un QR de muestra:
+    lo que se acomoda en la vista es exactamente el tamaño de lo que sale."""
     from PIL import Image, ImageDraw, ImageFont
 
     dibujo = dibujo if dibujo is not None else _muestra_dibujo(perfil)
@@ -578,10 +634,29 @@ def componer_sello(perfil: Perfil, cuando: dt.datetime, dibujo=None):
             break
         tam -= 1
     alto_texto = int(tam * 1.5)
-    sello = Image.new("RGBA", (ancho, dibujo.height + alto_texto), (255, 255, 255, 0))
+    rotulo = f"Folio {folio or FOLIO_MUESTRA}"
+    tam_f = int(tam * 2)   # el folio se teclea a mano: más grande y en negritas
+    while True:
+        letra_f = ImageFont.truetype(FUENTE_FOLIO, tam_f) if FUENTE_FOLIO else ImageFont.load_default(tam_f)
+        caja = letra_f.getbbox(rotulo)
+        if caja[2] - caja[0] <= ancho * 0.95 or tam_f <= 8:
+            break
+        tam_f -= 1
+    alto_folio = int(tam_f * 1.45)
+    alto = dibujo.height + alto_texto + alto_folio
+    lado_qr = max(alto, int(ancho * 0.36))   # el QR no debe quedar diminuto
+    alto = max(alto, lado_qr)
+    hueco = int(lado_qr * 0.08)
+    sello = Image.new("RGBA", (ancho + hueco + lado_qr, alto), (255, 255, 255, 0))
     sello.alpha_composite(dibujo, ((ancho - dibujo.width) // 2, 0))
     d = ImageDraw.Draw(sello)
     d.text((ancho / 2, dibujo.height + alto_texto / 2), texto, font=letra, fill=(80, 80, 80, 255), anchor="mm")
+    d.text((ancho / 2, dibujo.height + alto_texto + alto_folio / 2), rotulo, font=letra_f,
+           fill=(20, 35, 90, 255), anchor="mm")
+    qr_texto = texto_qr(folio or "FE-MUES-TRA0", perfil.nombre, cuando, huella or "0" * 16)
+    fondo = Image.new("RGBA", (lado_qr, lado_qr), (255, 255, 255, 255))   # el QR necesita fondo blanco
+    fondo.alpha_composite(_imagen_qr(qr_texto, lado_qr))
+    sello.alpha_composite(fondo, (ancho + hueco, (alto - lado_qr) // 2))
     return sello
 
 
@@ -591,10 +666,11 @@ class SinSelloDeTiempo(Exception):
 
 def firmar_pdf(pdf: Path, salida: Path, perfil: Perfil, firmante, dibujo, pagina: int,
                caja: tuple[float, float, float, float], cuando: dt.datetime | None = None,
-               con_sello: bool = True) -> Path:
+               con_sello: bool = True, documento: str = "") -> tuple[Path, str]:
     """Firma (visible + digital) en la `caja` de la `pagina` (coordenadas de pantalla de PyMuPDF).
     Si el PDF ya tenía firmas, la nueva se agrega sin romperlas (actualización incremental).
-    con_sello: pide sello de tiempo a DigiCert/Sectigo; si ninguno contesta → SinSelloDeTiempo."""
+    con_sello: pide sello de tiempo a DigiCert/Sectigo; si ninguno contesta → SinSelloDeTiempo.
+    Regresa (salida, folio); una copia queda en el Archivo con ese folio."""
     import pymupdf
     from pyhanko import stamp
     from pyhanko.pdf_utils import images
@@ -615,7 +691,9 @@ def firmar_pdf(pdf: Path, salida: Path, perfil: Perfil, firmante, dibujo, pagina
     while campo in existentes:
         campo, n = f"{base}-{n}", n + 1
 
-    sello = componer_sello(perfil, cuando or dt.datetime.now(), dibujo)
+    cuando = cuando or dt.datetime.now()
+    folio, huella = nuevo_folio(), sha256_archivo(pdf)
+    sello = componer_sello(perfil, cuando, dibujo, folio, huella)
     estilo = stamp.StaticStampStyle(background=images.PdfImage(sello), background_opacity=1, border_width=0)
     temporal = salida.with_name(salida.name + ".tmp")
     servicios = TSAS if con_sello else (None,)
@@ -626,7 +704,7 @@ def firmar_pdf(pdf: Path, salida: Path, perfil: Perfil, firmante, dibujo, pagina
                 with open(pdf, "rb") as f:
                     w = IncrementalPdfFileWriter(f, strict=False)
                     meta = signers.PdfSignatureMetadata(
-                        field_name=campo, name=perfil.nombre,
+                        field_name=campo, name=perfil.nombre, location=f"Folio {folio}",
                         reason=perfil.cargo or "Firma del documento", md_algorithm="sha256")
                     pdf_signer = signers.PdfSigner(
                         meta, signer=firmante, stamp_style=estilo, timestamper=sellador,
@@ -642,7 +720,101 @@ def firmar_pdf(pdf: Path, salida: Path, perfil: Perfil, firmante, dibujo, pagina
         os.replace(temporal, salida)
     finally:
         temporal.unlink(missing_ok=True)
-    return salida
+    archivar(salida, folio, perfil, cuando, huella, documento or salida.name, pagina, sellador is not None)
+    return salida, folio
+
+
+# =====================================================================
+#  Archivo de documentos firmados (para comparar con la hoja impresa)
+# =====================================================================
+
+def archivar(salida: Path, folio: str, perfil: Perfil, cuando: dt.datetime, huella_base: str,
+             documento: str, pagina: int, con_sello: bool) -> dict:
+    carpeta = ARCHIVO / folio
+    carpeta.mkdir(parents=True)
+    _privado(ARCHIVO, carpeta=True)
+    _privado(carpeta, carpeta=True)
+    copia = carpeta / "firmado.pdf"
+    shutil.copy2(salida, copia)
+    _privado(copia)
+    datos = {"folio": folio, "documento": documento, "guardado_en": str(salida),
+             "firmo": perfil.nombre, "cargo": perfil.cargo, "fecha": cuando.astimezone().isoformat(),
+             "pagina": pagina, "con_sello": con_sello,
+             "huella_base": huella_base,             # el PDF tal como estaba antes de esta firma
+             "sha256": sha256_archivo(copia)}        # el PDF ya firmado
+    _escribir_privado(carpeta / "datos.json", json.dumps(datos, ensure_ascii=False, indent=2).encode())
+    return {**datos, "carpeta": carpeta}
+
+
+def listar_archivo() -> list[dict]:
+    entradas = []
+    for c in ARCHIVO.glob("FE-*/datos.json") if ARCHIVO.is_dir() else ():
+        try:
+            entradas.append({**json.loads(c.read_text("utf-8")), "carpeta": c.parent})
+        except (OSError, ValueError):
+            continue
+    return sorted(entradas, key=lambda e: e.get("fecha", ""), reverse=True)
+
+
+def buscar_folio(texto: str) -> dict | None:
+    folio = normalizar_folio(texto)
+    archivo = ARCHIVO / folio / "datos.json" if folio else None
+    if not archivo or not archivo.exists():
+        return None
+    return {**json.loads(archivo.read_text("utf-8")), "carpeta": archivo.parent}
+
+
+def revisar_archivado(entrada: dict) -> tuple[bool, str]:
+    """¿La copia del archivo sigue intacta y sus firmas son válidas?"""
+    copia = Path(entrada["carpeta"]) / "firmado.pdf"
+    if not copia.exists():
+        return False, "La copia de este documento ya no está en el archivo."
+    if sha256_archivo(copia) != entrada.get("sha256"):
+        return False, "¡La copia del archivo fue MODIFICADA después de guardarse!"
+    ok, texto = verificar_texto(copia)
+    return ok, texto
+
+
+def comparar_pdf(pdf: Path, entrada: dict) -> str:
+    """Compara un PDF cualquiera con el documento archivado de ese folio."""
+    copia = Path(entrada["carpeta"]) / "firmado.pdf"
+    otro, orig = pdf.read_bytes(), copia.read_bytes()
+    if otro == orig:
+        return "✔ Es EXACTAMENTE el mismo documento firmado (folio " + entrada["folio"] + ")."
+    if otro.startswith(orig):
+        return ("✔ Es el mismo documento firmado, y después se le agregaron más cosas (por ejemplo, "
+                "otras firmas). Revisa en «Verificar» qué se agregó.")
+    if orig.startswith(otro) or sha256_archivo(pdf) == entrada.get("huella_base"):
+        return "≈ Es una versión ANTERIOR del documento: todavía sin esta firma."
+    return "✘ NO coincide: es un documento distinto (o fue modificado) respecto al del folio " + entrada["folio"] + "."
+
+
+def leer_qr(ruta: Path) -> list[str]:
+    """Textos de los QR de una foto o escaneo (imagen o PDF)."""
+    import zxingcpp
+    from PIL import Image, ImageOps
+    imagenes = []
+    if ruta.suffix.lower() == ".pdf":
+        import pymupdf
+        with pymupdf.open(ruta) as doc:
+            for pag in doc:
+                pm = pag.get_pixmap(dpi=250)
+                imagenes.append(Image.frombytes("RGB", (pm.width, pm.height), pm.samples))
+    else:
+        imagenes.append(ImageOps.exif_transpose(Image.open(ruta)).convert("RGB"))
+    textos = []
+    for img in imagenes:
+        for intento in (img, ImageOps.autocontrast(img.convert("L"))):
+            encontrados = [b.text for b in zxingcpp.read_barcodes(intento) if b.text]
+            if encontrados:
+                textos += encontrados
+                break
+    return textos
+
+
+def folio_en(texto: str) -> str | None:
+    m = re.search(r"FE-[0-9A-Z]{4}-[0-9A-Z]{4}", texto.upper())
+    return m.group(0) if m else None
 
 
 def _es_falla_de_sello(e: BaseException) -> bool:
@@ -713,7 +885,11 @@ def verificar(pdf: Path) -> tuple[bool, list[dict]]:
             revocada = revoc.get(sig.signer_cert.sha256.hex(":").upper()) if registrada else None
             antes_de_revocar = bool(revocada and fecha_sello
                                     and fecha_sello < dt.datetime.fromisoformat(revocada["desde"]))
+            lugar = str(sig.sig_object.get("/Location", "") or "")
+            folio = folio_en(lugar)
             detalles.append({
+                "folio": folio,
+                "archivado": bool(folio and (ARCHIVO / folio / "datos.json").exists()),
                 "quien": sig.signer_cert.subject.native.get("common_name", "?"),
                 "cargo": sig.signer_cert.subject.native.get("title", ""),
                 "fecha": fecha.astimezone() if fecha else None,
@@ -736,6 +912,9 @@ def verificar_texto(pdf: Path) -> tuple[bool, str]:
     lineas = []
     for d in detalles:
         lineas.append(f"Firmado por: {d['quien']}" + (f" ({d['cargo']})" if d["cargo"] else ""))
+        if d.get("folio"):
+            lineas.append(f"  Folio: {d['folio']}" + (" (guardado en el Archivo de esta PC)" if d["archivado"]
+                                                       else " (no está en el Archivo de esta PC)"))
         if d["fecha"]:
             origen = (f"sello de tiempo de {d['sello']}: fecha confiable" if d["sello"] else
                       "sello de tiempo NO válido; fecha según el reloj de la PC" if d["sello_invalido"] else

@@ -1,12 +1,14 @@
 """Ventana de Firma Electrónica.
 
 Pestañas: 1) Firmar documento (vista de la hoja: la firma se arrastra y se agranda/achica),
-2) Firmas (varias personas, cada una con su dibujo, certificado y contraseña), 3) Verificar.
+2) Firmas (varias personas, cada una con su dibujo, certificado y contraseña), 3) Verificar,
+4) Archivo (los documentos firmados, por folio, para compararlos con la hoja impresa).
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import re
 import shutil
 import subprocess
 import tempfile
@@ -18,7 +20,7 @@ from PIL.ImageQt import ImageQt
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame,
     QGraphicsItem, QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QHBoxLayout, QInputDialog,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton, QSlider, QSplitter,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton, QSizePolicy, QSlider, QSplitter,
     QStackedWidget, QVBoxLayout, QWidget,
 )
 
@@ -457,7 +459,7 @@ class Ventana(QWidget):
         self.menu.setFixedWidth(230)
         self.tabs = QStackedWidget()
         for texto, pagina in (("✍   Firmar documento", self._tab_firmar()), ("👤   Firmas", self._tab_firmas()),
-                              ("✔   Verificar", self._tab_verificar())):
+                              ("✔   Verificar", self._tab_verificar()), ("🗂   Archivo", self._tab_archivo())):
             self.menu.addItem(texto)
             self.tabs.addWidget(pagina)
         self.menu.currentRowChanged.connect(self.tabs.setCurrentIndex)
@@ -608,7 +610,7 @@ class Ventana(QWidget):
         sello = nucleo.componer_sello(perfil, dt.datetime.now())
         dibujo_alto = (perfil.dibujo_tam or (900, 300))[1]
         item = FirmaItem(QPixmap.fromImage(ImageQt(sello)), dibujo_alto / sello.height,
-                         anterior.ancho if anterior and conservar else 170)
+                         anterior.ancho if anterior and conservar else 240)
         item.al_cambiar = lambda a: self.sld_tam.setValue(int(a))
         if anterior and conservar:
             item.setPos(anterior.pos())
@@ -620,7 +622,7 @@ class Ventana(QWidget):
             hoja = self.vista.hoja.sceneBoundingRect()
             if linea:  # centrada sobre la línea: dibujo y leyenda arriba, sin tapar el nombre de abajo
                 x0, _y0, x1, y1 = linea
-                item.ancho = max(120.0, min(220.0, x1 - x0))
+                item.ancho = max(200.0, min(300.0, (x1 - x0) * 1.5))   # lleva el QR a la derecha
                 item.setPos((x0 + x1) / 2 - item.ancho / 2, y1 - item.alto() - 1)
             else:  # sin línea: abajo a la derecha
                 item.setPos(hoja.right() - item.ancho - 60, hoja.bottom() - item.alto() - 70)
@@ -657,8 +659,9 @@ class Ventana(QWidget):
             dibujo = perfil.leer_dibujo(clave)
             while True:
                 try:
-                    nucleo.firmar_pdf(self.pdf, salida, perfil, firmante, dibujo, self.pagina,
-                                      self.vista.firma.caja(), con_sello=con_sello)
+                    _, folio = nucleo.firmar_pdf(self.pdf, salida, perfil, firmante, dibujo, self.pagina,
+                                                 self.vista.firma.caja(), con_sello=con_sello,
+                                                 documento=self.origen.name)
                     break
                 except nucleo.SinSelloDeTiempo:
                     QApplication.restoreOverrideCursor()
@@ -681,13 +684,14 @@ class Ventana(QWidget):
         caja = QMessageBox(QMessageBox.Icon.Information, nucleo.NOMBRE,
                            f"Listo, firmado por {perfil.nombre}"
                            + (" (con sello de tiempo)" if con_sello else " (SIN sello de tiempo)")
-                           + f":\n\n{salida}", parent=self)
+                           + f":\n\n{salida}\n\nFolio: {folio} (una copia quedó en el Archivo)", parent=self)
         b_abrir = caja.addButton("Abrir", QMessageBox.ButtonRole.AcceptRole)
         b_otra = caja.addButton("Que firme otra persona", QMessageBox.ButtonRole.ActionRole)
         caja.addButton("Cerrar", QMessageBox.ButtonRole.RejectRole)
         caja.exec()
         if caja.clickedButton() is b_abrir:
             subprocess.Popen(["xdg-open", str(salida)], start_new_session=True)
+        self.recargar_archivo(seleccionar=folio)
         # Seguimos con el documento ya firmado: así otra persona puede firmar el mismo PDF.
         self.cargar_documento(salida)
         if caja.clickedButton() is b_otra and self.cmb_firma.count() > 1:
@@ -984,6 +988,167 @@ class Ventana(QWidget):
         color, encabezado = (VERDE_OK, "✔ Firmas válidas") if ok else (ROJO, "✘ Atención")
         self.lbl_verif.setText(f"<h3 style='color:{color};margin-bottom:4px'>{encabezado}</h3>"
                                f"<b>{pdf.name}</b><br><br>" + texto.replace("\n", "<br>").replace("  ", "&nbsp;&nbsp;"))
+
+
+    # ---------------- 4. archivo ----------------
+    def _tab_archivo(self) -> QWidget:
+        w = QWidget()
+        self.txt_buscar = QLineEdit()
+        self.txt_buscar.setPlaceholderText("Buscar por folio (FE-XXXX-XXXX), persona o documento…")
+        self.txt_buscar.textChanged.connect(lambda _t: self.recargar_archivo())
+        b_hoja = _boton_grande("Revisar hoja impresa (foto o escaneo)…")
+        b_hoja.clicked.connect(self.revisar_hoja)
+        fila = QHBoxLayout()
+        fila.addWidget(self.txt_buscar, 1)
+        fila.addWidget(b_hoja)
+        self.lst_archivo = QListWidget()
+        self.lst_archivo.setWordWrap(True)
+        self.lst_archivo.currentRowChanged.connect(lambda _r: self.mostrar_archivado())
+        self.lbl_archivado = QLabel()
+        self.lbl_archivado.setWordWrap(True)
+        self.lbl_archivado.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.img_archivado = QLabel()
+        self.img_archivado.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.img_archivado.setMinimumHeight(260)
+        # Que la imagen no empuje el tamaño del recuadro (si no, se recorta y se ve solo el centro)
+        self.img_archivado.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        b_abrir = QPushButton("Abrir el original")
+        b_abrir.clicked.connect(lambda: self._entrada_actual() and subprocess.Popen(
+            ["xdg-open", str(Path(self._entrada_actual()["carpeta"]) / "firmado.pdf")], start_new_session=True))
+        b_comparar = QPushButton("Comparar con otro PDF…")
+        b_comparar.clicked.connect(self.comparar_con_pdf)
+        b_carpeta = QPushButton("Abrir carpeta")
+        b_carpeta.clicked.connect(lambda: self._entrada_actual() and subprocess.Popen(
+            ["xdg-open", str(self._entrada_actual()["carpeta"])], start_new_session=True))
+        self.botones_archivo = [b_abrir, b_comparar, b_carpeta]
+        fb = QHBoxLayout()
+        for b in self.botones_archivo:
+            fb.addWidget(b)
+        der, ld = _tarjeta()
+        ld.addWidget(self.lbl_archivado)
+        ld.addWidget(self.img_archivado, 1)
+        ld.addLayout(fb)
+        partir = QSplitter()
+        partir.addWidget(self.lst_archivo)
+        partir.addWidget(der)
+        partir.setSizes([360, 640])
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(_titulo("Archivo", "Cada documento que firmas se guarda aquí con su folio. Con la hoja "
+                                         "impresa (o una foto o escaneo de ella) encuentras el original para "
+                                         "comparar: lo que vale es el PDF, no el papel."))
+        lay.addLayout(fila)
+        lay.addWidget(partir, 1)
+        self.recargar_archivo()
+        return w
+
+    def recargar_archivo(self, seleccionar: str | None = None) -> None:
+        filtro = self.txt_buscar.text().strip().lower()
+        folio_buscado = nucleo.normalizar_folio(filtro) if filtro else None
+        self.lst_archivo.blockSignals(True)
+        self.lst_archivo.clear()
+        for e in nucleo.listar_archivo():
+            texto = f"{e['folio']} · {e.get('documento', '')} · {e.get('firmo', '')}".lower()
+            if filtro and filtro not in texto and folio_buscado != e["folio"]:
+                continue
+            fecha = dt.datetime.fromisoformat(e["fecha"])
+            it = QListWidgetItem(f"{e['folio']}  ·  {fecha:%d/%m/%Y %H:%M}\n{e.get('documento', '')}\n"
+                                 f"Firmó: {e.get('firmo', '')}")
+            it.setData(Qt.ItemDataRole.UserRole, e["folio"])
+            self.lst_archivo.addItem(it)
+            if seleccionar == e["folio"]:
+                self.lst_archivo.setCurrentItem(it)
+        self.lst_archivo.blockSignals(False)
+        if self.lst_archivo.currentRow() < 0 and self.lst_archivo.count():
+            self.lst_archivo.setCurrentRow(0)
+        self.mostrar_archivado()
+
+    def _entrada_actual(self) -> dict | None:
+        it = self.lst_archivo.currentItem()
+        return nucleo.buscar_folio(it.data(Qt.ItemDataRole.UserRole)) if it else None
+
+    def mostrar_archivado(self, aviso: str = "") -> None:
+        e = self._entrada_actual()
+        for b in self.botones_archivo:
+            b.setEnabled(e is not None)
+        self.img_archivado.clear()
+        if not e:
+            self.lbl_archivado.setText(aviso or "<span style='color:gray'>Todavía no hay documentos firmados "
+                                                "en el archivo (se guardan solos al firmar).</span>")
+            return
+        ok, texto = nucleo.revisar_archivado(e)
+        color = VERDE_OK if ok else ROJO
+        fecha = dt.datetime.fromisoformat(e["fecha"])
+        self.lbl_archivado.setText(
+            (aviso + "<br><br>" if aviso else "")
+            + f"<h3 style='margin:0'>Folio {e['folio']}</h3><b>{e.get('documento', '')}</b><br>"
+            f"Firmó {e.get('firmo', '')} el {fecha:%d/%m/%Y a las %H:%M}"
+            + ("" if e.get("con_sello") else " (sin sello de tiempo)") + "<br>"
+            f"<span style='color:{color}'>{'✔ Copia intacta y firmas válidas' if ok else '✘ Atención'}</span><br>"
+            f"<small>{texto.replace(chr(10), '<br>')}</small><br>"
+            "<small>Compara la hoja impresa con esta página del original, renglón por renglón:</small>")
+        try:
+            import pymupdf
+            with pymupdf.open(Path(e["carpeta"]) / "firmado.pdf") as doc:
+                pag = doc[min(int(e.get("pagina", 0)), len(doc) - 1)]
+                pm = pag.get_pixmap(dpi=110)
+                img = QImage(pm.samples, pm.width, pm.height, pm.stride, QImage.Format.Format_RGB888).copy()
+            caja = self.img_archivado.contentsRect().size()
+            ancho, alto = max(caja.width(), 300), max(caja.height(), 300)
+            self.img_archivado.setPixmap(QPixmap.fromImage(img).scaled(
+                ancho, alto, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        except Exception:
+            pass
+
+    def revisar_hoja(self) -> None:
+        ruta, _ = QFileDialog.getOpenFileName(self, "Foto o escaneo de la hoja firmada", _descargas(),
+                                              "Fotos y escaneos (*.jpg *.jpeg *.png *.webp *.tif *.tiff *.bmp *.pdf)")
+        if not ruta:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            textos = nucleo.leer_qr(Path(ruta))
+        except Exception as ex:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, nucleo.NOMBRE, f"No se pudo leer la imagen:\n{ex}")
+            return
+        QApplication.restoreOverrideCursor()
+        folios = [(nucleo.folio_en(t), t) for t in textos if nucleo.folio_en(t)]
+        if not folios:
+            QMessageBox.information(self, nucleo.NOMBRE,
+                                    "No encontré el código QR de la firma en esa imagen.\n\n"
+                                    "Prueba con una foto más cercana y derecha, o escribe el folio que viene "
+                                    "impreso junto a la firma en el buscador.")
+            return
+        folio, texto = folios[-1]
+        e = nucleo.buscar_folio(folio)
+        if not e:
+            QMessageBox.warning(self, nucleo.NOMBRE,
+                                f"La hoja trae el folio {folio}, pero no está en el Archivo de esta PC "
+                                f"(¿se firmó en otra computadora?).\n\nLo que dice el QR:\n{texto}")
+            return
+        huella_qr = re.search(r"Huella:\s*([0-9A-F]+)", texto)
+        coincide = huella_qr and e.get("huella_base", "").startswith(huella_qr.group(1))
+        aviso = (f"<span style='color:{VERDE_OK}'>✔ La hoja corresponde al folio {folio} del Archivo.</span>"
+                 if coincide else
+                 f"<span style='color:{ROJO}'>✘ El QR dice folio {folio}, pero su huella NO coincide con la del "
+                 "archivo: el QR pudo copiarse de otro documento.</span>")
+        if len(folios) > 1:
+            aviso += f"<br><small>La hoja tiene {len(folios)} firmas con QR; se muestra la última.</small>"
+        self.txt_buscar.blockSignals(True)
+        self.txt_buscar.clear()
+        self.txt_buscar.blockSignals(False)
+        self.recargar_archivo(seleccionar=folio)
+        self.mostrar_archivado(aviso)
+
+    def comparar_con_pdf(self) -> None:
+        e = self._entrada_actual()
+        if not e:
+            return
+        ruta, _ = QFileDialog.getOpenFileName(self, f"PDF para comparar con el folio {e['folio']}", _descargas(),
+                                              "PDF (*.pdf)")
+        if ruta:
+            QMessageBox.information(self, nucleo.NOMBRE, nucleo.comparar_pdf(Path(ruta), e))
 
 
 def abrir(docs: list[Path], verificar: Path | None = None) -> None:
